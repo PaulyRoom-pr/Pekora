@@ -1,0 +1,14 @@
+{
+  "name": "pekora",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pekora — a video, shorts and live streaming site with DMs, watch parties and the Qrox AI assistant.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  }
+}
