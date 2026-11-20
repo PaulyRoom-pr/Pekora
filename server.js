@@ -15,11 +15,11 @@ const E = process.env;
 const GITHUB_OWNER = 'PaulyRoom-pr';
 const GITHUB_REPO = 'Pekora';
 const GITHUB_BRANCH = 'main';
-const GITHUB_API = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents?ref=${GITHUB_BRANCH}`;
-const REPO_CACHE_TTL = 5 * 60_000;
-const repoFiles = new Map();
-let repoFilesLoadedAt = 0;
-let repoLoadPromise = null;
+const GITHUB_RAW_BASE = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/`;
+
+// Keep the last successful response only as an outage fallback.
+// Every incoming static-file request still tries GitHub first.
+const lastKnownGoodFiles = new Map();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -261,73 +261,10 @@ async function handleGifs(url, req, res) {
   }
 }
 
-// ---------- GitHub repository root files ----------
-// Downloads the root file listing, then downloads each file into memory.
-// No local public/ directory, no folders, and no files need to be moved.
-async function loadRepoFiles(force = false) {
-  if (!force && repoFilesLoadedAt && Date.now() - repoFilesLoadedAt < REPO_CACHE_TTL) {
-    return;
-  }
-  if (repoLoadPromise) return repoLoadPromise;
-
-  repoLoadPromise = (async () => {
-    const headers = {
-      Accept: 'application/vnd.github+json',
-      'User-Agent': 'Pekora-Node-Server',
-    };
-    if (E.GITHUB_TOKEN) headers.Authorization = `Bearer ${E.GITHUB_TOKEN}`;
-
-    const listingResponse = await fetch(GITHUB_API, {
-      headers,
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (!listingResponse.ok) {
-      throw new Error(`GitHub file listing failed: HTTP ${listingResponse.status}`);
-    }
-
-    const listing = await listingResponse.json();
-    if (!Array.isArray(listing)) {
-      throw new Error('GitHub did not return a root file listing.');
-    }
-
-    // Only direct root files are included. Directory entries are deliberately ignored.
-    const rootFiles = listing.filter((entry) =>
-      entry.type === 'file' &&
-      typeof entry.name === 'string' &&
-      !entry.name.includes('/') &&
-      typeof entry.download_url === 'string'
-    );
-
-    if (!rootFiles.some((file) => file.name.toLowerCase() === 'index.html')) {
-      throw new Error('The GitHub repository root does not contain index.html.');
-    }
-
-    const downloaded = await Promise.all(rootFiles.map(async (file) => {
-      const response = await fetch(file.download_url, {
-        headers: { 'User-Agent': 'Pekora-Node-Server' },
-        signal: AbortSignal.timeout(20_000),
-      });
-      if (!response.ok) {
-        throw new Error(`Could not download ${file.name}: HTTP ${response.status}`);
-      }
-      return [file.name, Buffer.from(await response.arrayBuffer())];
-    }));
-
-    repoFiles.clear();
-    for (const [name, content] of downloaded) repoFiles.set(name, content);
-    repoFilesLoadedAt = Date.now();
-
-    console.log(`[github] Loaded ${repoFiles.size} root files from ${GITHUB_OWNER}/${GITHUB_REPO}`);
-    console.log(`[github] Entry page: ${[...repoFiles.keys()].find((name) => name.toLowerCase() === 'index.html')}`);
-  })();
-
-  try {
-    await repoLoadPromise;
-  } finally {
-    repoLoadPromise = null;
-  }
-}
-
+// ---------- live GitHub root-file serving ----------
+// Every static request fetches that exact root file from GitHub.
+// There is no time-based cache and no local public/ directory.
+// If GitHub temporarily fails, serve the last successful copy if available.
 async function serveStatic(req, res, pathname) {
   let requested;
   try {
@@ -337,52 +274,75 @@ async function serveStatic(req, res, pathname) {
     return res.end('Bad request');
   }
 
-  if (requested.includes('\0') || requested.includes('\\') || requested.includes('..')) {
+  // This repository is intentionally flat: do not resolve directories or subfolders.
+  if (
+    requested.includes('\0') ||
+    requested.includes('\\') ||
+    requested.split('/').some((part) => part === '..')
+  ) {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('Bad request');
   }
 
-  // Root-only routing: / becomes /index.html; nested paths are not used.
   const filename = requested === '/' || requested === ''
     ? 'index.html'
     : requested.replace(/^\/+/, '');
 
-  if (!filename || filename.includes('/')) {
+  if (!filename || filename.includes('/') || filename === '.' || filename === '..') {
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('Not found');
   }
 
+  // Encode the filename as one URL path segment; files stay in the repository root.
+  const githubUrl = GITHUB_RAW_BASE + encodeURIComponent(filename);
+  let content = null;
+  let servedStaleCopy = false;
+
   try {
-    await loadRepoFiles();
+    const githubResponse = await fetch(githubUrl, {
+      headers: { 'User-Agent': 'Pekora-Node-Server' },
+      signal: AbortSignal.timeout(15_000),
+      cache: 'no-store',
+    });
+
+    if (githubResponse.ok) {
+      content = Buffer.from(await githubResponse.arrayBuffer());
+      lastKnownGoodFiles.set(filename.toLowerCase(), content);
+    } else if (githubResponse.status === 404) {
+      res.writeHead(404, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      return res.end('Not found');
+    } else {
+      throw new Error(`GitHub returned HTTP ${githubResponse.status}`);
+    }
   } catch (err) {
-    console.error('[github]', err.message);
+    console.error(`[github] Could not refresh ${filename}:`, err.message);
+    content = lastKnownGoodFiles.get(filename.toLowerCase()) || null;
+    servedStaleCopy = Boolean(content);
+  }
+
+  if (!content) {
     res.writeHead(503, {
       'Content-Type': 'text/plain; charset=utf-8',
       'Cache-Control': 'no-store',
-      'Retry-After': '30',
+      'Retry-After': '5',
     });
-    return res.end('Website files could not be loaded from GitHub. Please try again shortly.');
+    return res.end('GitHub is temporarily unavailable and this file has not been cached yet. Please retry.');
   }
 
-  // Resolve index.html without relying on filename capitalization.
-  const actualName = [...repoFiles.keys()].find(
-    (name) => name.toLowerCase() === filename.toLowerCase()
-  );
-  const content = actualName ? repoFiles.get(actualName) : null;
-
-  if (!content) {
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('Not found');
-  }
-
-  const ext = actualName.includes('.') ? `.${actualName.split('.').pop().toLowerCase()}` : '';
+  const ext = filename.includes('.') ? `.${filename.split('.').pop().toLowerCase()}` : '';
   const type = MIME[ext] || 'application/octet-stream';
-  const longCache = ['.svg', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.ico', '.woff', '.woff2'].includes(ext);
 
   res.writeHead(200, {
     'Content-Type': type,
     'Content-Length': content.length,
-    'Cache-Control': longCache ? 'public, max-age=86400' : 'no-cache',
+    // Prevent browsers/CDNs from keeping an old copy; the server checks GitHub on every request.
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+    'X-Pekora-Source': servedStaleCopy ? 'github-fallback-cache' : 'github-live',
     'X-Content-Type-Options': 'nosniff',
   });
 
@@ -417,10 +377,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Pekora running on http://localhost:${PORT}`);
-  loadRepoFiles().catch((err) => {
-    console.error('[github] Initial repository download failed:', err.message);
-    console.error('[github] Static files will retry automatically when requested.');
-  });
   if (!E.FIREBASE_API_KEY) console.warn('! FIREBASE_* env vars are missing — the site will show the setup screen.');
   if (!E.GROQ_API_KEY) console.warn('! GROQ_API_KEY is missing — Qrox will be disabled.');
   if (!E.GIPHY_API_KEY) console.warn('! GIPHY_API_KEY is missing — comment GIF search will fall back to pasting a GIF link.');
