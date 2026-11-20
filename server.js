@@ -1,19 +1,25 @@
 // Pekora server — zero npm dependencies (Node 20+).
-//  • serves the static site from /public
+//  • fetches every file in the GitHub repository ROOT (no folders)
+//  • serves the repository's root index.html and other root files
 //  • GET  /api/config  -> public Firebase web config + feature flags (from env vars)
 //  • POST /api/qrox    -> Qrox AI assistant (Groq). The API key never leaves the server.
 //  • GET  /api/gifs    -> GIF search for comments (GIPHY proxy, optional)
 //  • GET  /healthz     -> Render health check
 import http from 'node:http';
-import { stat } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const PUBLIC_DIR = path.join(ROOT, 'public');
 const PORT = Number(process.env.PORT) || 3000;
 const E = process.env;
+
+// The repository is intentionally treated as FLAT: only files directly in
+// the root of this GitHub repository are downloaded and served.
+const GITHUB_OWNER = 'PaulyRoom-pr';
+const GITHUB_REPO = 'Pekora';
+const GITHUB_BRANCH = 'main';
+const GITHUB_API = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents?ref=${GITHUB_BRANCH}`;
+const REPO_CACHE_TTL = 5 * 60_000;
+const repoFiles = new Map();
+let repoFilesLoadedAt = 0;
+let repoLoadPromise = null;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -30,6 +36,16 @@ const MIME = {
   '.ico': 'image/x-icon',
   '.webmanifest': 'application/manifest+json',
   '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
+  '.webm': 'video/webm',
+  '.mp4': 'video/mp4',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
 };
 
 // ---------- helpers ----------
@@ -245,44 +261,133 @@ async function handleGifs(url, req, res) {
   }
 }
 
-// ---------- static files ----------
-async function serveStatic(req, res, pathname) {
-  let rel;
-  try {
-    rel = decodeURIComponent(pathname);
-  } catch {
-    res.writeHead(400);
-    return res.end('Bad request');
+// ---------- GitHub repository root files ----------
+// Downloads the root file listing, then downloads each file into memory.
+// No local public/ directory, no folders, and no files need to be moved.
+async function loadRepoFiles(force = false) {
+  if (!force && repoFilesLoadedAt && Date.now() - repoFilesLoadedAt < REPO_CACHE_TTL) {
+    return;
   }
-  if (rel.includes('\0')) {
-    res.writeHead(400);
-    return res.end('Bad request');
-  }
-  let full = path.normalize(path.join(PUBLIC_DIR, rel));
-  if (full !== PUBLIC_DIR && !full.startsWith(PUBLIC_DIR + path.sep)) {
-    res.writeHead(403);
-    return res.end('Forbidden');
-  }
-  try {
-    let st = await stat(full);
-    if (st.isDirectory()) {
-      full = path.join(full, 'index.html');
-      st = await stat(full);
-    }
-    const ext = path.extname(full).toLowerCase();
-    const type = MIME[ext] || 'application/octet-stream';
-    const longCache = ['.svg', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.ico'].includes(ext);
-    res.writeHead(200, {
-      'Content-Type': type,
-      'Content-Length': st.size,
-      'Cache-Control': longCache ? 'public, max-age=86400' : 'no-cache',
+  if (repoLoadPromise) return repoLoadPromise;
+
+  repoLoadPromise = (async () => {
+    const headers = {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'Pekora-Node-Server',
+    };
+    if (E.GITHUB_TOKEN) headers.Authorization = `Bearer ${E.GITHUB_TOKEN}`;
+
+    const listingResponse = await fetch(GITHUB_API, {
+      headers,
+      signal: AbortSignal.timeout(20_000),
     });
-    if (req.method === 'HEAD') return res.end();
-    createReadStream(full).pipe(res);
-  } catch {
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Not found');
+    if (!listingResponse.ok) {
+      throw new Error(`GitHub file listing failed: HTTP ${listingResponse.status}`);
+    }
+
+    const listing = await listingResponse.json();
+    if (!Array.isArray(listing)) {
+      throw new Error('GitHub did not return a root file listing.');
+    }
+
+    // Only direct root files are included. Directory entries are deliberately ignored.
+    const rootFiles = listing.filter((entry) =>
+      entry.type === 'file' &&
+      typeof entry.name === 'string' &&
+      !entry.name.includes('/') &&
+      typeof entry.download_url === 'string'
+    );
+
+    if (!rootFiles.some((file) => file.name.toLowerCase() === 'index.html')) {
+      throw new Error('The GitHub repository root does not contain index.html.');
+    }
+
+    const downloaded = await Promise.all(rootFiles.map(async (file) => {
+      const response = await fetch(file.download_url, {
+        headers: { 'User-Agent': 'Pekora-Node-Server' },
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!response.ok) {
+        throw new Error(`Could not download ${file.name}: HTTP ${response.status}`);
+      }
+      return [file.name, Buffer.from(await response.arrayBuffer())];
+    }));
+
+    repoFiles.clear();
+    for (const [name, content] of downloaded) repoFiles.set(name, content);
+    repoFilesLoadedAt = Date.now();
+
+    console.log(`[github] Loaded ${repoFiles.size} root files from ${GITHUB_OWNER}/${GITHUB_REPO}`);
+    console.log(`[github] Entry page: ${[...repoFiles.keys()].find((name) => name.toLowerCase() === 'index.html')}`);
+  })();
+
+  try {
+    await repoLoadPromise;
+  } finally {
+    repoLoadPromise = null;
   }
+}
+
+async function serveStatic(req, res, pathname) {
+  let requested;
+  try {
+    requested = decodeURIComponent(pathname);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Bad request');
+  }
+
+  if (requested.includes('\0') || requested.includes('\\') || requested.includes('..')) {
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Bad request');
+  }
+
+  // Root-only routing: / becomes /index.html; nested paths are not used.
+  const filename = requested === '/' || requested === ''
+    ? 'index.html'
+    : requested.replace(/^\/+/, '');
+
+  if (!filename || filename.includes('/')) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Not found');
+  }
+
+  try {
+    await loadRepoFiles();
+  } catch (err) {
+    console.error('[github]', err.message);
+    res.writeHead(503, {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Retry-After': '30',
+    });
+    return res.end('Website files could not be loaded from GitHub. Please try again shortly.');
+  }
+
+  // Resolve index.html without relying on filename capitalization.
+  const actualName = [...repoFiles.keys()].find(
+    (name) => name.toLowerCase() === filename.toLowerCase()
+  );
+  const content = actualName ? repoFiles.get(actualName) : null;
+
+  if (!content) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Not found');
+  }
+
+  const ext = actualName.includes('.') ? `.${actualName.split('.').pop().toLowerCase()}` : '';
+  const type = MIME[ext] || 'application/octet-stream';
+  const longCache = ['.svg', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.ico', '.woff', '.woff2'].includes(ext);
+
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Content-Length': content.length,
+    'Cache-Control': longCache ? 'public, max-age=86400' : 'no-cache',
+    'X-Content-Type-Options': 'nosniff',
+  });
+
+  if (req.method === 'HEAD') return res.end();
+  return res.end(content);
 }
 
 // ---------- server ----------
@@ -312,6 +417,10 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Pekora running on http://localhost:${PORT}`);
+  loadRepoFiles().catch((err) => {
+    console.error('[github] Initial repository download failed:', err.message);
+    console.error('[github] Static files will retry automatically when requested.');
+  });
   if (!E.FIREBASE_API_KEY) console.warn('! FIREBASE_* env vars are missing — the site will show the setup screen.');
   if (!E.GROQ_API_KEY) console.warn('! GROQ_API_KEY is missing — Qrox will be disabled.');
   if (!E.GIPHY_API_KEY) console.warn('! GIPHY_API_KEY is missing — comment GIF search will fall back to pasting a GIF link.');
