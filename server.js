@@ -1,25 +1,19 @@
 // Pekora server — zero npm dependencies (Node 20+).
-//  • fetches every file in the GitHub repository ROOT (no folders)
-//  • serves the repository's root index.html and other root files
+//  • serves the static site from /public
 //  • GET  /api/config  -> public Firebase web config + feature flags (from env vars)
 //  • POST /api/qrox    -> Qrox AI assistant (Groq). The API key never leaves the server.
 //  • GET  /api/gifs    -> GIF search for comments (GIPHY proxy, optional)
 //  • GET  /healthz     -> Render health check
 import http from 'node:http';
+import { stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(ROOT, 'public');
 const PORT = Number(process.env.PORT) || 3000;
 const E = process.env;
-
-// The repository is intentionally treated as FLAT: only files directly in
-// the root of this GitHub repository are downloaded and served.
-const GITHUB_OWNER = 'PaulyRoom-pr';
-const GITHUB_REPO = 'Pekora';
-const GITHUB_BRANCH = 'main';
-const GITHUB_RAW_BASE = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/`;
-
-// Keep the last successful response only as an outage fallback.
-// Every incoming static-file request still tries GitHub first.
-const lastKnownGoodFiles = new Map();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -36,16 +30,6 @@ const MIME = {
   '.ico': 'image/x-icon',
   '.webmanifest': 'application/manifest+json',
   '.txt': 'text/plain; charset=utf-8',
-  '.md': 'text/markdown; charset=utf-8',
-  '.xml': 'application/xml; charset=utf-8',
-  '.webm': 'video/webm',
-  '.mp4': 'video/mp4',
-  '.mp3': 'audio/mpeg',
-  '.ogg': 'audio/ogg',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-  '.ttf': 'font/ttf',
-  '.otf': 'font/otf',
 };
 
 // ---------- helpers ----------
@@ -108,8 +92,22 @@ function readJson(req, limit = 16_384) {
 const clean = (s, n) => String(s ?? '').replace(/[\u0000-\u001f]+/g, ' ').trim().slice(0, n);
 
 // ---------- /api/config ----------
+function iceServers() {
+  // Optional TURN: set ICE_SERVERS_JSON='[{"urls":"turn:host:3478","username":"u","credential":"p"}]'
+  const base = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+  if (!E.ICE_SERVERS_JSON) return base;
+  try {
+    const extra = JSON.parse(E.ICE_SERVERS_JSON);
+    return Array.isArray(extra) ? base.concat(extra) : base;
+  } catch {
+    console.warn('! ICE_SERVERS_JSON is not valid JSON — ignoring it.');
+    return base;
+  }
+}
+
 function handleConfig(res) {
   json(res, 200, {
+    iceServers: iceServers(),
     firebase: {
       apiKey: E.FIREBASE_API_KEY || '',
       authDomain: E.FIREBASE_AUTH_DOMAIN || '',
@@ -261,93 +259,56 @@ async function handleGifs(url, req, res) {
   }
 }
 
-// ---------- live GitHub root-file serving ----------
-// Every static request fetches that exact root file from GitHub.
-// There is no time-based cache and no local public/ directory.
-// If GitHub temporarily fails, serve the last successful copy if available.
+// ---------- static files ----------
 async function serveStatic(req, res, pathname) {
-  let requested;
+  let rel;
   try {
-    requested = decodeURIComponent(pathname);
+    rel = decodeURIComponent(pathname);
   } catch {
-    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.writeHead(400);
     return res.end('Bad request');
   }
-
-  // This repository is intentionally flat: do not resolve directories or subfolders.
-  if (
-    requested.includes('\0') ||
-    requested.includes('\\') ||
-    requested.split('/').some((part) => part === '..')
-  ) {
-    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+  if (rel.includes('\0')) {
+    res.writeHead(400);
     return res.end('Bad request');
   }
-
-  const filename = requested === '/' || requested === ''
-    ? 'index.html'
-    : requested.replace(/^\/+/, '');
-
-  if (!filename || filename.includes('/') || filename === '.' || filename === '..') {
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('Not found');
+  let full = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (full !== PUBLIC_DIR && !full.startsWith(PUBLIC_DIR + path.sep)) {
+    res.writeHead(403);
+    return res.end('Forbidden');
   }
-
-  // Encode the filename as one URL path segment; files stay in the repository root.
-  const githubUrl = GITHUB_RAW_BASE + encodeURIComponent(filename);
-  let content = null;
-  let servedStaleCopy = false;
-
   try {
-    const githubResponse = await fetch(githubUrl, {
-      headers: { 'User-Agent': 'Pekora-Node-Server' },
-      signal: AbortSignal.timeout(15_000),
-      cache: 'no-store',
-    });
-
-    if (githubResponse.ok) {
-      content = Buffer.from(await githubResponse.arrayBuffer());
-      lastKnownGoodFiles.set(filename.toLowerCase(), content);
-    } else if (githubResponse.status === 404) {
-      res.writeHead(404, {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Cache-Control': 'no-store',
-      });
-      return res.end('Not found');
-    } else {
-      throw new Error(`GitHub returned HTTP ${githubResponse.status}`);
+    let st = await stat(full);
+    if (st.isDirectory()) {
+      full = path.join(full, 'index.html');
+      st = await stat(full);
     }
-  } catch (err) {
-    console.error(`[github] Could not refresh ${filename}:`, err.message);
-    content = lastKnownGoodFiles.get(filename.toLowerCase()) || null;
-    servedStaleCopy = Boolean(content);
-  }
-
-  if (!content) {
-    res.writeHead(503, {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Retry-After': '5',
+    const ext = path.extname(full).toLowerCase();
+    const type = MIME[ext] || 'application/octet-stream';
+    const longCache = ['.svg', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.ico'].includes(ext);
+    res.writeHead(200, {
+      'Content-Type': type,
+      'Content-Length': st.size,
+      'Cache-Control': longCache ? 'public, max-age=86400' : 'no-cache',
     });
-    return res.end('GitHub is temporarily unavailable and this file has not been cached yet. Please retry.');
+    if (req.method === 'HEAD') return res.end();
+    createReadStream(full).pipe(res);
+  } catch {
+    // single-page app: any extension-less path (/watch/abc, /@name ...) gets index.html
+    if (!path.extname(rel)) {
+      try {
+        const index = path.join(PUBLIC_DIR, 'index.html');
+        const st = await stat(index);
+        res.writeHead(200, { 'Content-Type': MIME['.html'], 'Content-Length': st.size, 'Cache-Control': 'no-cache' });
+        if (req.method === 'HEAD') return res.end();
+        return createReadStream(index).pipe(res);
+      } catch {
+        /* fall through to 404 */
+      }
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not found');
   }
-
-  const ext = filename.includes('.') ? `.${filename.split('.').pop().toLowerCase()}` : '';
-  const type = MIME[ext] || 'application/octet-stream';
-
-  res.writeHead(200, {
-    'Content-Type': type,
-    'Content-Length': content.length,
-    // Prevent browsers/CDNs from keeping an old copy; the server checks GitHub on every request.
-    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-    'Pragma': 'no-cache',
-    'Expires': '0',
-    'X-Pekora-Source': servedStaleCopy ? 'github-fallback-cache' : 'github-live',
-    'X-Content-Type-Options': 'nosniff',
-  });
-
-  if (req.method === 'HEAD') return res.end();
-  return res.end(content);
 }
 
 // ---------- server ----------
